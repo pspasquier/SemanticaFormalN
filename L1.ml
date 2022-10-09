@@ -1,3 +1,4 @@
+open Printf
 (*++++++++++++++++++++++++++++++++++++++*)
 (*  Interpretador para L1               *)
 (*   - inferência de tipos              *)
@@ -45,8 +46,11 @@ type valor =
   | VClos  of ident * expr * renv
   | VRclos of ident * ident * expr * renv
   | VSkip
+  | VIdent of ident
 and
-  renv = (ident * valor) list
+  renv = (ident * valor) list 
+  
+type mem = (ident * valor) list
     
 (* funções polimórficas para ambientes *)
 let rec lookup a k =
@@ -54,11 +58,24 @@ let rec lookup a k =
   | [] -> None
   | (y,i) :: tl -> if (y=k) then Some i else lookup tl k
        
-let rec update a k i = (k,i) :: a
-
+let rec update a k i = 
+  (match a with
+   | [] -> 
+       (k,i) :: a
+   | (y,a) :: tl -> 
+       if (y=k) then (k,i) :: tl
+       else (y,a) :: (update tl k i)) 
+  
+let rec max_address a m =
+  (match a with
+   | [] -> m 
+   | (y,a) :: tl -> 
+       let v = int_of_string y in 
+       max_address tl (max v m))
+  
 (* exceções que não devem ocorrer  *) 
 exception BugParser 
-exception BugTypeInfer 
+exception BugTypeInfer
                        
 (**+++++++++++++++++++++++++++++++++++++++++*)
 (*         INFERÊNCIA DE TIPOS              *)
@@ -128,7 +145,7 @@ let rec typeinfer (tenv:tenv) (e:expr) : tipo =
          TyRef(t) ->
            if t2 = t then TyUnit
            else raise (TypeError "ref e atribuicao de tipos diferentes")
-       | _ -> raise (TypeError "tipo ref era esperado"))
+       | _ -> raise (TypeError "era esperado um tipo ref"))
 
   | Dref(e1) ->
       let t1 = typeinfer tenv e1 in
@@ -150,7 +167,7 @@ let rec typeinfer (tenv:tenv) (e:expr) : tipo =
       let t2 = typeinfer tenv e2 in
       (match t1 with
          TyUnit -> t2
-       | _     -> raise (TypeError "e1 de Seq não é do tipo unit"))
+       | _     -> raise (TypeError "era esperado um tipo unit"))
 
 (**+++++++++++++++++++++++++++++++++++++++++*)
 (*                 AVALIADOR                *)
@@ -168,56 +185,91 @@ let compute (oper: op) (v1: valor) (v2: valor) : valor =
   | _ -> raise BugTypeInfer
 
 
-let rec eval (renv:renv) (e:expr) : valor =
+let rec eval (renv:renv) (mem:mem) (e:expr) : (valor * mem) =
   match e with
-  | Num n -> VNum n
+  | Num n -> (VNum n, mem)
 
-  | True -> VTrue
+  | True -> (VTrue, mem)
 
-  | False -> VFalse
+  | False -> (VFalse, mem)
 
   | Var x ->
       (match lookup renv x with
-         Some v -> v
+         Some v -> (v, mem)
        | None -> raise BugTypeInfer)
 
   | Binop(oper,e1,e2) ->
-      let v1 = eval renv e1 in
-      let v2 = eval renv e2 in
-      compute oper v1 v2
+      let (v1, mem) = eval renv mem e1 in
+      let (v2, mem) = eval renv mem e2 in
+      (compute oper v1 v2, mem)
 
   | If(e1,e2,e3) ->
-      (match eval renv e1 with
-         VTrue  -> eval renv e2
-       | VFalse -> eval renv e3
-       | _ -> raise BugTypeInfer )
+      let (v1, mem) = eval renv mem e1 in
+      (match v1 with
+         VTrue  -> eval renv mem e2
+       | VFalse -> eval renv mem e3
+       | _ -> raise BugTypeInfer)
 
-  | Fn (x,_,e1) ->  VClos(x,e1,renv)
+  | Fn (x,_,e1) ->  (VClos(x,e1,renv), mem)
 
   | App(e1,e2) ->
-      let v1 = eval renv e1 in
-      let v2 = eval renv e2 in
+      let (v1, mem) = eval renv mem e1 in
+      let (v2, mem) = eval renv mem e2 in
       (match v1 with
          VClos(x,ebdy,renv') ->
            let renv'' = update renv' x v2
-           in eval renv'' ebdy
+           in eval renv'' mem ebdy
 
        | VRclos(f,x,ebdy,renv') ->
            let renv''  = update renv' x v2 in
            let renv''' = update renv'' f v1
-           in eval renv''' ebdy
+           in eval renv''' mem ebdy
        | _ -> raise BugTypeInfer)
 
   | Let(x,_,e1,e2) ->
-      let v1 = eval renv e1
-      in eval (update renv x v1) e2
+      let (v1, mem) = eval renv mem e1
+      in eval (update renv x v1) mem e2
 
   | LetRec(f,TyFn(t1,t2),Fn(x,tx,e1), e2) when t1 = tx ->
       let renv'= update renv f (VRclos(f,x,e1,renv))
-      in eval renv' e2
+      in eval renv' mem e2
 
   | LetRec _ -> raise BugParser
                   
+  | Skip -> (VSkip, mem)
+                  
+  | Asg(e1,e2) ->
+      let (v1, mem) = eval renv mem e1 in 
+      let (v2, mem) = eval renv mem e2 in
+      (match v1 with 
+         VIdent(t) -> 
+           (match lookup mem t with
+              Some a -> (VSkip, update mem t v2) 
+            | None -> raise BugTypeInfer) 
+       | _ -> raise BugTypeInfer)
+      
+  | Dref(e) -> 
+      let (v, mem) = eval renv mem e in
+      (match v with 
+         VIdent(t) ->
+           (match lookup mem t with
+              Some a -> (a, mem)
+            | None -> raise BugTypeInfer) 
+       | _ -> raise BugTypeInfer) 
+      
+  | New(e) ->
+      let (v, mem) = eval renv mem e in
+      let i = sprintf "%d" ((max_address mem 0) + 1) in
+      (VIdent(i), update mem i v)
+      
+  | Whl(e1, e2) ->  eval renv mem (If (e1, Seq(e2, Whl(e1, e2)), Skip)) 
+                      
+  | Seq(e1,e2) ->
+      let (v1, mem) = eval renv mem e1 in
+      (match v1 with
+         VSkip -> eval renv mem e2
+       | _ -> raise BugTypeInfer)
+          
 (* função auxiliar que converte tipo para string *)
 let rec ttos (t:tipo) : string =
   match t with
@@ -236,45 +288,23 @@ let rec vtos (v: valor) : string =
   | VClos _ ->  "fn"
   | VRclos _ -> "fn"
   | VSkip -> "skip"
+  | VIdent _ -> "ident"
 
 (* principal do interpretador *)
 let int_bse (e:expr) : unit =
   try
     let t = typeinfer [] e in
-    let v = eval [] e
+    let (v, mem) = eval [] [] e
     in  print_string ((vtos v) ^ " : " ^ (ttos t))
-  with
+  with 
     TypeError msg ->  print_string ("erro de tipo - " ^ msg)
-   
- (* as exceções abaixo nao podem ocorrer   *)
+  (* as exceções abaixo nao podem ocorrer   *) 
   | BugTypeInfer  ->  print_string "corrigir bug em typeinfer"
   | BugParser     ->  print_string "corrigir bug no parser para let rec"
 
 (* +++++++++++++++++++++++++++++++++++++++*)
 (*                TESTES                  *)
-(*++++++++++++++++++++++++++++++++++++++++*)
-
-(*
-     let x:int = 2
-     in let foo: int --> int = fn y:int => x + y
-        in let x: int = 5
-           in foo 10
-*)
-
-let e'' = Let("x", TyInt, Num 5, App(Var "foo", Num 10))
-let e'  = Let("foo", TyFn(TyInt,TyInt), Fn("y", TyInt, Binop(Sum, Var "x", Var "y")), e'')
-let tst = Let("x", TyInt, Num(2), e')
-
-(*
-      let x:int = 2
-      in let foo: int --> int = fn y:int => x + y
-      in let x: int = 5
-      in foo
-*)
-let e2 = Let("x", TyInt, Num 5, Var "foo")
-let e1  = Let("foo", TyFn(TyInt,TyInt), Fn("y", TyInt, Binop(Sum, Var "x", Var "y")), e2)
-let tst2 = Let("x", TyInt, Num(2), e1)
-  
+(*++++++++++++++++++++++++++++++++++++++++*) 
 (*  
     o programa abaixo retorna
         valor   = 7 
@@ -333,13 +363,13 @@ let counter1 = Let("counter", TyRef TyInt, New (Num 0),
      
 let fat (x:int) : int = 
 
-        let z : int ref = new x in
-        let y : int ref = new 1 in 
-while (!z > 0) (
-y :=  !y * !z;
-    z :=  !z - 1;
-  );
-  ! y
+  let z : int ref = new x in
+  let y : int ref = new 1 in 
+  while (!z > 0) (
+      y :=  !y * !z;
+      z :=  !z - 1;
+    );
+    ! y
 in
 fat 5
        
